@@ -27,7 +27,7 @@ Autoload
 - The plugin automatically re-applies highlights on `BufEnter` and `BufWritePost` for files detected under a `groups/<group>/<nickname>/...` path.
 
 Notes
-- Transparency: terminals generally can’t render alpha. The plugin uses soft tints to approximate VS Code’s semi-transparent highlights. Override via:
+- Transparency: terminals generally can’t render alpha. The default indicator uses a thin colored sign in the gutter (no background fill). To approximate VS Code rgba with backgrounds, you can still set soft tints:
   - `vim.g.retrieves_reported_bg = "#FFE5E6"` (soft red)
   - `vim.g.retrieves_pending_bg  = "#FFF9C4"` (soft yellow)
   - Or set your own: `:hi RetrievesReported guibg=#HEX`, `:hi RetrievesPending guibg=#HEX`.
@@ -37,3 +37,4 @@ Notes
 UI options
 - `vim.g.retrieves_show_eol = true` to show a compact end-of-line summary (title or count).
 - `vim.g.retrieves_hover = true` to enable a CursorHold hover with details and links.
+- `vim.g.retrieves_indicator = 'sign'` (default) for a thin bar in sign column; set to `'background'` to fill the entire line (no transparency in terminals).
