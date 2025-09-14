@@ -7,6 +7,7 @@ local ns = vim.api.nvim_create_namespace("retrieves")
 local reported_hl = "RetrievesReported"
 local pending_hl  = "RetrievesPending"
 local endpoint = "https://app.fluidattacks.com/api"
+local sign_group  = "retrieves_signs"
 
 -- In-memory cache keyed by group name
 local cache_by_group = {}
@@ -82,6 +83,12 @@ local function define_default_hls()
   local pen = vim.g.retrieves_pending_bg or "#FFF9C4" -- soft yellow tint
   vim.api.nvim_set_hl(0, reported_hl, { bg = rep })
   vim.api.nvim_set_hl(0, pending_hl,  { bg = pen })
+
+  -- Sign colors (thin bar in the sign column)
+  local rep_fg = vim.g.retrieves_reported_fg or "#ff3435"
+  local pen_fg = vim.g.retrieves_pending_fg or "#fff333"
+  vim.api.nvim_set_hl(0, "RetrievesReportedSign", { fg = rep_fg })
+  vim.api.nvim_set_hl(0, "RetrievesPendingSign", { fg = pen_fg })
 end
 
 local function detect_group(filepath)
@@ -381,7 +388,12 @@ local function apply(buf)
 
   local org = snapshot.org or (cache_by_group[group.name] and cache_by_group[group.name].org) or ""
   local show_eol = (vim.g.retrieves_show_eol ~= false)
+  local indicator = vim.g.retrieves_indicator or 'sign' -- 'sign' (default) or 'background'
   local linecount = vim.api.nvim_buf_line_count(buf)
+  -- Clear previous signs if using sign indicators
+  if indicator ~= 'background' then
+    pcall(vim.fn.sign_unplace, sign_group, { buffer = buf })
+  end
 
   local function place_for(state, title, id, locs)
     local hl_group = state == 'reported' and reported_hl or pending_hl
@@ -389,8 +401,14 @@ local function apply(buf)
       local ln = tonumber(l) or 1
       if ln <= 0 then ln = 1 end
       if ln <= linecount then
-        -- highlight whole line
-        pcall(vim.api.nvim_buf_add_highlight, buf, ns, hl_group, ln - 1, 0, -1)
+        if indicator == 'background' then
+          -- highlight whole line
+          pcall(vim.api.nvim_buf_add_highlight, buf, ns, hl_group, ln - 1, 0, -1)
+        else
+          -- place thin bar sign
+          local sign_name = (state == 'reported') and 'retrieves_reported' or 'retrieves_pending'
+          pcall(vim.fn.sign_place, 0, sign_group, sign_name, buf, { lnum = ln, priority = 9 })
+        end
         -- store metadata for hover/open
         local url = string.format("https://app.fluidattacks.com/orgs/%s/groups/%s/vulns/%s/locations/", org, group.name, id)
         add_line_meta(buf, ln, { state = state, title = title, id = id, url = url })
@@ -435,6 +453,9 @@ end
 
 function M.setup()
   define_default_hls()
+  -- Define signs (thin bar). Do once; harmless if redefined.
+  pcall(vim.fn.sign_define, 'retrieves_reported', { text = '▎', texthl = 'RetrievesReportedSign', numhl = '' })
+  pcall(vim.fn.sign_define, 'retrieves_pending',  { text = '▎', texthl = 'RetrievesPendingSign',  numhl = '' })
   vim.api.nvim_create_user_command("RetrievesRefresh", function()
     M.refresh()
   end, {})
