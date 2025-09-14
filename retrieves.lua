@@ -77,9 +77,11 @@ local function make_request_async(query, variables, cb)
 end
 
 local function define_default_hls()
-  -- Light tints. Users can override in their config.
-  vim.api.nvim_set_hl(0, reported_hl, { default = true, bg = "#FFCDD2" }) -- light red
-  vim.api.nvim_set_hl(0, pending_hl,  { default = true, bg = "#FFF9C4" }) -- light yellow
+  -- Allow override via globals; fall back to readable tints similar to VS Code rgba fills.
+  local rep = vim.g.retrieves_reported_bg or "#FFE5E6" -- soft red tint
+  local pen = vim.g.retrieves_pending_bg or "#FFF9C4" -- soft yellow tint
+  vim.api.nvim_set_hl(0, reported_hl, { bg = rep })
+  vim.api.nvim_set_hl(0, pending_hl,  { bg = pen })
 end
 
 local function detect_group(filepath)
@@ -313,16 +315,17 @@ local function clear(buf)
   end
 end
 
-local function hl_lines(buf, lines, hl_group)
-  if not lines or type(lines) ~= "table" then return end
-  local linecount = vim.api.nvim_buf_line_count(buf)
-  for _, l in ipairs(lines) do
-    local ln = tonumber(l) or 0
-    if ln <= 0 then ln = 1 end
-    if ln <= linecount then
-      pcall(vim.api.nvim_buf_add_highlight, buf, ns, hl_group, ln - 1, 0, -1)
-    end
-  end
+-- Per-buffer line metadata
+local line_meta = {}
+
+local function add_line_meta(buf, ln, entry)
+  line_meta[buf] = line_meta[buf] or {}
+  line_meta[buf][ln] = line_meta[buf][ln] or {}
+  table.insert(line_meta[buf][ln], entry)
+end
+
+local function clear_line_meta(buf)
+  if line_meta[buf] then line_meta[buf] = nil end
 end
 
 local function apply(buf)
@@ -374,16 +377,53 @@ local function apply(buf)
   local drafts   = (snapshot.drafts   or {})[key]
 
   clear(buf)
+  clear_line_meta(buf)
 
-  -- reported: red, drafts: yellow
+  local org = snapshot.org or (cache_by_group[group.name] and cache_by_group[group.name].org) or ""
+  local show_eol = (vim.g.retrieves_show_eol ~= false)
+  local linecount = vim.api.nvim_buf_line_count(buf)
+
+  local function place_for(state, title, id, locs)
+    local hl_group = state == 'reported' and reported_hl or pending_hl
+    for _, l in ipairs(locs or {}) do
+      local ln = tonumber(l) or 1
+      if ln <= 0 then ln = 1 end
+      if ln <= linecount then
+        -- highlight whole line
+        pcall(vim.api.nvim_buf_add_highlight, buf, ns, hl_group, ln - 1, 0, -1)
+        -- store metadata for hover/open
+        local url = string.format("https://app.fluidattacks.com/orgs/%s/groups/%s/vulns/%s/locations/", org, group.name, id)
+        add_line_meta(buf, ln, { state = state, title = title, id = id, url = url })
+      end
+    end
+  end
+
   if reported then
-    for _, entry in pairs(reported) do
-      hl_lines(buf, entry.locs, reported_hl)
+    for title, entry in pairs(reported) do
+      place_for('reported', title, entry.id, entry.locs)
     end
   end
   if drafts then
-    for _, entry in pairs(drafts) do
-      hl_lines(buf, entry.locs, pending_hl)
+    for title, entry in pairs(drafts) do
+      place_for('pending', title, entry.id, entry.locs)
+    end
+  end
+
+  if show_eol and line_meta[buf] then
+    for ln, entries in pairs(line_meta[buf]) do
+      local summary
+      if #entries == 1 then
+        summary = string.format(" %s", entries[1].title)
+      else
+        summary = string.format(" %d findings", #entries)
+      end
+      -- small, dimmed eol text
+      local vt = { { "  " .. summary, "Comment" } }
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns, ln - 1, 0, {
+        virt_text = vt,
+        virt_text_pos = "eol",
+        priority = 60,
+      })
     end
   end
 end
@@ -433,6 +473,57 @@ function M.setup()
       end
     end,
   })
+
+  -- Optional hover on CursorHold
+  local function show_hover()
+    local buf = vim.api.nvim_get_current_buf()
+    local pos = vim.api.nvim_win_get_cursor(0)
+    local ln = pos[1]
+    local entries = line_meta[buf] and line_meta[buf][ln]
+    if not entries or #entries == 0 then return end
+    local lines = { "Retrieves" }
+    for _, e in ipairs(entries) do
+      table.insert(lines, string.format("- %s: %s", e.state == 'reported' and 'reported' or 'pending', e.title))
+      table.insert(lines, string.format("  %s", e.url))
+    end
+    local bufnr, winnr = vim.lsp.util.open_floating_preview(lines, 'markdown', { border = 'rounded', focusable = false })
+    -- Auto-close after short delay
+    vim.defer_fn(function()
+      if vim.api.nvim_win_is_valid(winnr) then pcall(vim.api.nvim_win_close, winnr, true) end
+      if vim.api.nvim_buf_is_valid(bufnr) then pcall(vim.api.nvim_buf_delete, bufnr, { force = true }) end
+    end, 2500)
+  end
+
+  if vim.g.retrieves_hover ~= false then
+    vim.api.nvim_create_autocmd("CursorHold", {
+      group = vim.api.nvim_create_augroup("retrieves_nvim_hover", { clear = true }),
+      callback = function()
+        show_hover()
+      end,
+    })
+  end
+
+  vim.api.nvim_create_user_command("RetrievesHover", function()
+    local ok, _ = pcall(show_hover)
+    if not ok then return end
+  end, {})
+
+  vim.api.nvim_create_user_command("RetrievesOpenLink", function()
+    local buf = vim.api.nvim_get_current_buf()
+    local pos = vim.api.nvim_win_get_cursor(0)
+    local ln = pos[1]
+    local entry = line_meta[buf] and line_meta[buf][ln] and line_meta[buf][ln][1]
+    if not entry then
+      vim.notify("Retrieves: no link on this line", vim.log.levels.INFO)
+      return
+    end
+    if type(vim.ui.open) == 'function' then
+      vim.ui.open(entry.url)
+    else
+      local opener = vim.fn.has('mac') == 1 and 'open' or (vim.fn.executable('xdg-open') == 1 and 'xdg-open' or 'start')
+      vim.fn.jobstart({ opener, entry.url }, { detach = true })
+    end
+  end, {})
 end
 
 -- Auto-setup if sourced directly

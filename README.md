@@ -20,11 +20,20 @@ Live Download (GraphQL)
 Commands
 - `:RetrievesRefresh` — re-scan and re-apply highlights for the current buffer.
 - `:RetrievesDownload` — fetch locations from the Platform for the detected group and apply highlights.
+- `:RetrievesHover` — show a small floating window with the finding name(s) and link(s) for the current line.
+- `:RetrievesOpenLink` — open the first finding link on the current line in your system browser.
 
 Autoload
 - The plugin automatically re-applies highlights on `BufEnter` and `BufWritePost` for files detected under a `groups/<group>/<nickname>/...` path.
 
 Notes
-- Colors are light tints for readability in Neovim (no transparency). Override the highlight groups `RetrievesReported` and `RetrievesPending` to tweak styling.
+- Transparency: terminals generally can’t render alpha. The plugin uses soft tints to approximate VS Code’s semi-transparent highlights. Override via:
+  - `vim.g.retrieves_reported_bg = "#FFE5E6"` (soft red)
+  - `vim.g.retrieves_pending_bg  = "#FFF9C4"` (soft yellow)
+  - Or set your own: `:hi RetrievesReported guibg=#HEX`, `:hi RetrievesPending guibg=#HEX`.
 - If you do not use the VS Code extension, you can generate a compatible JSON with keys `reported` and `drafts`, keyed by `<nickname>/<relative_path>`, each containing an object of finding titles -> `{ id, locs: [line_numbers] }`.
 - Requires `curl` available in your PATH for live downloads.
+
+UI options
+- `vim.g.retrieves_show_eol = true` to show a compact end-of-line summary (title or count).
+- `vim.g.retrieves_hover = true` to enable a CursorHold hover with details and links.
