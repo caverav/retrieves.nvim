@@ -19,10 +19,6 @@
             jq
             ripgrep
             git
-            nodejs_20
-            nodePackages.vsce
-            yarn
-            pnpm
           ];
           shellHook = ''
             echo "[retrieves.nvim] Neovim $(nvim --version | head -n1) | Node $(node --version)";
