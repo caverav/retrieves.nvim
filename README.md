@@ -1,4 +1,4 @@
-# Retrieves.nvim (co-located with VS Code extension)
+# retrieves.nvim
 
 Neovim plugin to highlight reported/pending vulnerability lines in files under `groups/<group>/<nickname>/...` and fetch locations asynchronously from the Platform.
 
@@ -10,17 +10,17 @@ Quick start
   - Or copy to your plugin manager’s path.
 - Open a file under `groups/<group>/<nickname>/...`.
   - If a snapshot exists (`<repo>/retrieves-vulns-<group>.json`), highlights appear immediately.
-  - Otherwise, a background download starts; you’ll get notifications for start and completion; highlights apply when ready.
+  - Otherwise, a background download starts; you'll get notifications for start and completion; highlights apply when ready.
 
 Commands
-- `:RetrievesDownload` — background-fetch locations for the detected group and apply.
-- `:RetrievesRefresh` — re-apply highlights in the current buffer.
-- `:RetrievesHover` — show a small floating window with finding name(s) and link(s) for the current line.
-- `:RetrievesOpenLink` — open the first finding link on the current line in the system browser.
+- `:RetrievesDownload` - background-fetch locations for the detected group and apply.
+- `:RetrievesRefresh` - re-apply highlights in the current buffer.
+- `:RetrievesHover` - show a small floating window with finding name(s) and link(s) for the current line.
+- `:RetrievesOpenLink` - open the first finding link on the current line in the system browser.
 
 Indicators
 - Default: thin colored sign bar in the gutter (no background fill).
-- Optional: full-line background fill — set `vim.g.retrieves_indicator = 'background'`.
+- Optional: full-line background fill - set `vim.g.retrieves_indicator = 'background'`.
   - Note: terminals do not support alpha; use soft tints instead.
 
 Color overrides
@@ -31,6 +31,6 @@ Color overrides
 - Or define highlights directly: `:hi RetrievesReported guibg=#HEX`, `:hi RetrievesPending guibg=#HEX`.
 
 UI options
-- `vim.g.retrieves_show_eol = true` — show compact end-of-line summary (title or count).
-- `vim.g.retrieves_hover = true` — enable CursorHold hover with details and links.
+- `vim.g.retrieves_show_eol = true` - show compact end-of-line summary (title or count).
+- `vim.g.retrieves_hover = true` - enable CursorHold hover with details and links.
 
