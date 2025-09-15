@@ -1,40 +1,36 @@
-# Retrieves.nvim
+# Retrieves.nvim (co-located with VS Code extension)
 
-Minimal Neovim plugin that highlights reported/pending vulnerable lines, mirroring the VS Code "retrieves" extension behavior (highlighting only).
+Neovim plugin to highlight reported/pending vulnerability lines in files under `groups/<group>/<nickname>/...` and fetch locations asynchronously from the Platform.
 
-How it works:
-- Detects files under a `.../groups/<group>/<nickname>/<path>` tree (same layout used by the VS Code extension).
-- Looks for a JSON snapshot exported by the VS Code extension at `<repo>/retrieves-vulns-<group>.json`.
-- Applies full-line highlights for reported (red) and pending (yellow) locations in the current buffer.
-
-Usage
-- Place this folder on your `runtimepath` (e.g., with any plugin manager) or `:luafile` the `retrieves.lua` file directly.
-- Optional: set `vim.g.retrieves_json_override` to point to a custom JSON snapshot path if you do not use the VS Code exporter.
-
-Live Download (GraphQL)
-- Set environment variable `INTEGRATES_API_TOKEN` (or `vim.g.retrieves_token`) with your token.
-- Run `:RetrievesDownload` inside a file under `groups/<group>/<nickname>/...`.
-- The plugin shows notifications when downloading starts and when it completes.
-- Results are cached in-memory and also exported to `<repo>/retrieves-vulns-<group>.json` for reuse.
+Quick start
+- Ensure `curl` is on PATH and set your token:
+  - `export INTEGRATES_API_TOKEN=...` or `vim.g.retrieves_token = "..."`
+- Add this plugin folder to Neovim's runtimepath or your plugin manager, e.g.:
+  - `:set rtp+=/path/to/retrieves.nvim`
+  - Or copy to your plugin manager’s path.
+- Open a file under `groups/<group>/<nickname>/...`.
+  - If a snapshot exists (`<repo>/retrieves-vulns-<group>.json`), highlights appear immediately.
+  - Otherwise, a background download starts; you’ll get notifications for start and completion; highlights apply when ready.
 
 Commands
-- `:RetrievesRefresh` — re-scan and re-apply highlights for the current buffer.
-- `:RetrievesDownload` — fetch locations from the Platform for the detected group and apply highlights.
-- `:RetrievesHover` — show a small floating window with the finding name(s) and link(s) for the current line.
-- `:RetrievesOpenLink` — open the first finding link on the current line in your system browser.
+- `:RetrievesDownload` — background-fetch locations for the detected group and apply.
+- `:RetrievesRefresh` — re-apply highlights in the current buffer.
+- `:RetrievesHover` — show a small floating window with finding name(s) and link(s) for the current line.
+- `:RetrievesOpenLink` — open the first finding link on the current line in the system browser.
 
-Autoload
-- The plugin automatically re-applies highlights on `BufEnter` and `BufWritePost` for files detected under a `groups/<group>/<nickname>/...` path.
+Indicators
+- Default: thin colored sign bar in the gutter (no background fill).
+- Optional: full-line background fill — set `vim.g.retrieves_indicator = 'background'`.
+  - Note: terminals do not support alpha; use soft tints instead.
 
-Notes
-- Transparency: terminals generally can’t render alpha. The default indicator uses a thin colored sign in the gutter (no background fill). To approximate VS Code rgba with backgrounds, you can still set soft tints:
-  - `vim.g.retrieves_reported_bg = "#FFE5E6"` (soft red)
-  - `vim.g.retrieves_pending_bg  = "#FFF9C4"` (soft yellow)
-  - Or set your own: `:hi RetrievesReported guibg=#HEX`, `:hi RetrievesPending guibg=#HEX`.
-- If you do not use the VS Code extension, you can generate a compatible JSON with keys `reported` and `drafts`, keyed by `<nickname>/<relative_path>`, each containing an object of finding titles -> `{ id, locs: [line_numbers] }`.
-- Requires `curl` available in your PATH for live downloads.
+Color overrides
+- Gutter bar colors: `vim.g.retrieves_reported_fg = "#ff3435"`, `vim.g.retrieves_pending_fg = "#fff333"`.
+- Background tints (if using `background`):
+  - `vim.g.retrieves_reported_bg = "#FFE5E6"`
+  - `vim.g.retrieves_pending_bg  = "#FFF9C4"`
+- Or define highlights directly: `:hi RetrievesReported guibg=#HEX`, `:hi RetrievesPending guibg=#HEX`.
 
 UI options
-- `vim.g.retrieves_show_eol = true` to show a compact end-of-line summary (title or count).
-- `vim.g.retrieves_hover = true` to enable a CursorHold hover with details and links.
-- `vim.g.retrieves_indicator = 'sign'` (default) for a thin bar in sign column; set to `'background'` to fill the entire line (no transparency in terminals).
+- `vim.g.retrieves_show_eol = true` — show compact end-of-line summary (title or count).
+- `vim.g.retrieves_hover = true` — enable CursorHold hover with details and links.
+
