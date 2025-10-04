@@ -29,7 +29,7 @@ end
 
 local function detect_group(filepath)
   -- Matches: (root)/groups/(group)/(nickname)/(rest)
-  local root, group, nickname, rest = filepath:match("(.+)/groups/([^/]+)/([^/]+)/(.+)$")
+  local root, org, group, nickname, rest = filepath:match("(.+)/groups/([^/]+)/([^/]+)/([^/]+)/(.+)$")
   if not group then
     return nil
   end
