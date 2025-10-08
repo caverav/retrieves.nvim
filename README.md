@@ -17,6 +17,7 @@ Commands
 - `:RetrievesRefresh` - re-apply highlights in the current buffer.
 - `:RetrievesHover` - show a small floating window with finding name(s) and link(s) for the current line.
 - `:RetrievesOpenLink` - open the first finding link on the current line in the system browser.
+- `:RetrievesAttack` - mark the current file as attacked in the Platform (requires cached group data or a recent download).
 
 Indicators
 - Default: thin colored sign bar in the gutter (no background fill).
@@ -33,4 +34,3 @@ Color overrides
 UI options
 - `vim.g.retrieves_show_eol = true` - show compact end-of-line summary (title or count).
 - `vim.g.retrieves_hover = true` - enable CursorHold hover with details and links.
-

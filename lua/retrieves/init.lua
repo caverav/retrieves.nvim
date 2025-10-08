@@ -138,6 +138,20 @@ query GetDraftsFromUUID($uuid: String!, $draftToken: String!, $vulnToken: String
 }
 ]]
 
+local UPDATE_ATTACKED_TOE = [[
+mutation ($group: String!, $file: String!, $root: String!, $loc: Int!) {
+  updateToeLinesAttackedLines(
+    groupName: $group,
+    filename: $file,
+    rootId: $root,
+    attackedLines: $loc,
+    comments: ""
+  ) {
+    success
+  }
+}
+]]
+
 local function download_group_async(group_name, on_done)
   if inflight_by_group[group_name] then return end
   inflight_by_group[group_name] = true
@@ -283,6 +297,36 @@ local function load_snapshot(path)
   return json, nil
 end
 
+local function snapshot_path_for(group)
+  return vim.g.retrieves_json_override
+    or (group.repo_path .. "/retrieves-vulns-" .. group.name .. ".json")
+end
+
+local function ensure_group_entry(group)
+  if not group then
+    return nil, "group not detected"
+  end
+  local entry = cache_by_group[group.name]
+  if entry and entry.roots and entry.roots[group.nickname] then
+    return entry, nil
+  end
+
+  local snapshot, err = load_snapshot(snapshot_path_for(group))
+  if snapshot then
+    entry = entry or {}
+    entry.reported = entry.reported or snapshot.reported or {}
+    entry.drafts = entry.drafts or snapshot.drafts or {}
+    entry.roots = snapshot.roots or entry.roots or {}
+    entry.org = snapshot.org or entry.org or ""
+    cache_by_group[group.name] = entry
+    if entry.roots and entry.roots[group.nickname] then
+      return entry, nil
+    end
+  end
+
+  return entry, err or "root id unavailable"
+end
+
 local function clear(buf)
   if vim.api.nvim_buf_is_valid(buf) then
     vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
@@ -300,14 +344,23 @@ local function apply(buf)
     return
   end
 
-  local snapshot_path = vim.g.retrieves_json_override
-    or (group.repo_path .. "/retrieves-vulns-" .. group.name .. ".json")
+  local snapshot_path = snapshot_path_for(group)
 
   local snapshot, err = load_snapshot(snapshot_path)
-  if not snapshot and cache_by_group[group.name] then
-    snapshot = { reported = cache_by_group[group.name].reported, drafts = cache_by_group[group.name].drafts }
+  local entry = cache_by_group[group.name]
+  if snapshot then
+    entry = entry or {}
+    entry.reported = snapshot.reported or entry.reported or {}
+    entry.drafts = snapshot.drafts or entry.drafts or {}
+    entry.roots = snapshot.roots or entry.roots or {}
+    entry.org = snapshot.org or entry.org or ""
+    cache_by_group[group.name] = entry
+  elseif entry then
+    -- nothing more to do; we'll rely on cached data
   end
-  if not snapshot then
+
+  entry = cache_by_group[group.name]
+  if not entry then
     -- Kick off async download (non-blocking) if token present
     local token = vim.g.retrieves_token or vim.env.INTEGRATES_API_TOKEN
     if token and token ~= "" then
@@ -334,13 +387,13 @@ local function apply(buf)
   end
 
   local key = group.current_file
-  local reported = (snapshot.reported or {})[key]
-  local drafts   = (snapshot.drafts   or {})[key]
+  local reported = ((entry.reported or {}))[key]
+  local drafts   = ((entry.drafts   or {}))[key]
 
   clear(buf)
   clear_line_meta(buf)
 
-  local org = snapshot.org or (cache_by_group[group.name] and cache_by_group[group.name].org) or ""
+  local org = entry.org or ""
   local show_eol = (vim.g.retrieves_show_eol ~= false)
   local indicator = vim.g.retrieves_indicator or 'sign' -- 'sign' (default) or 'background'
   local linecount = vim.api.nvim_buf_line_count(buf)
@@ -425,7 +478,7 @@ function M.setup()
     download_group_async(group.name, function(res, err)
       if not res then return end
       -- Write snapshot
-      local snapshot_path = (group.repo_path .. "/retrieves-vulns-" .. group.name .. ".json")
+      local snapshot_path = snapshot_path_for(group)
       pcall(function()
         local fd = assert(io.open(snapshot_path, "w"))
         fd:write(vim.json.encode({
@@ -436,6 +489,70 @@ function M.setup()
       end)
       -- Apply to current buffer
       if vim.api.nvim_buf_is_valid(buf) then M.refresh() end
+    end)
+  end, {})
+
+  vim.api.nvim_create_user_command("RetrievesAttack", function()
+    local buf = vim.api.nvim_get_current_buf()
+    local name = vim.api.nvim_buf_get_name(buf)
+    if name == "" then
+      vim.notify("Retrieves: current buffer has no filename", vim.log.levels.WARN)
+      return
+    end
+    local group = detect_group(name)
+    if not group then
+      vim.notify("Retrieves: not a group file", vim.log.levels.WARN)
+      return
+    end
+
+    local function submit_request(root_id)
+      if not vim.api.nvim_buf_is_valid(buf) then
+        return
+      end
+      local attacked = math.max(vim.api.nvim_buf_line_count(buf) - 1, 0)
+      make_request_async(UPDATE_ATTACKED_TOE, {
+        group = group.name,
+        file = group.filename,
+        root = root_id,
+        loc = attacked,
+      }, function(data, req_err)
+        if not data then
+          vim.notify("Retrieves: failed to mark attacked: " .. tostring(req_err), vim.log.levels.ERROR)
+          return
+        end
+        local ok = data.updateToeLinesAttackedLines and data.updateToeLinesAttackedLines.success
+        if ok then
+          vim.notify("Retrieves: file marked as attacked", vim.log.levels.INFO)
+        else
+          vim.notify("Retrieves: failed to mark attacked", vim.log.levels.ERROR)
+        end
+      end)
+    end
+
+    local entry = ensure_group_entry(group)
+    entry = entry and cache_by_group[group.name] or entry
+    local root_id = entry and entry.roots and entry.roots[group.nickname]
+    if root_id then
+      submit_request(root_id)
+      return
+    end
+
+    if inflight_by_group[group.name] then
+      vim.notify("Retrieves: download in progress, try again shortly", vim.log.levels.INFO)
+      return
+    end
+
+    download_group_async(group.name, function(res, err)
+      if not res then
+        vim.notify("Retrieves: failed to refresh group data" .. (err and (": " .. tostring(err)) or ""), vim.log.levels.ERROR)
+        return
+      end
+      local rid = res.roots and res.roots[group.nickname]
+      if not rid then
+        vim.notify("Retrieves: root id not found for " .. group.current_file, vim.log.levels.ERROR)
+        return
+      end
+      submit_request(rid)
     end)
   end, {})
 
@@ -507,4 +624,3 @@ if vim.g.retrieves_autosetup ~= false then
 end
 
 return M
-
