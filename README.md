@@ -34,3 +34,4 @@ Color overrides
 UI options
 - `vim.g.retrieves_show_eol = true` - show compact end-of-line summary (title or count).
 - `vim.g.retrieves_hover = true` - enable CursorHold hover with details and links.
+- `vim.g.retrieves_progress_step = 10` - percent gap between download progress notifications (set smaller for more granular updates).

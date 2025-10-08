@@ -12,6 +12,7 @@ local sign_group  = "retrieves_signs"
 -- In-memory cache keyed by group name
 local cache_by_group = {}
 local inflight_by_group = {}
+local download_progress = {}
 
 local function define_default_hls()
   -- Allow override via globals; fall back to readable tints similar to VS Code rgba fills.
@@ -47,6 +48,37 @@ local function clean_location(where)
   -- Remove trailing bracketed metadata like " (commit)" or " [..]"
   where = where:gsub("%s*[%(%[].*[%]%)]", "")
   return where
+end
+
+local function notify_progress(group_name, done, total)
+  if total <= 0 then
+    done, total = 1, 1
+  end
+  local percent = math.floor((done / total) * 100)
+  local step = tonumber(vim.g.retrieves_progress_step or 10) or 10
+  local state = download_progress[group_name]
+  if not state then
+    state = { last_percent = -step }
+    download_progress[group_name] = state
+  end
+  if done == total then
+    download_progress[group_name] = nil
+  end
+
+  if done == total or (percent - state.last_percent) >= step then
+    state.last_percent = percent
+    local msg = string.format(
+      "Retrieves: downloading %s (%d/%d findings)",
+      group_name,
+      math.min(done, total),
+      total
+    )
+    if vim.notify then
+      vim.notify(msg, vim.log.levels.INFO, { title = "Retrieves" })
+    else
+      vim.api.nvim_echo({ { msg, "Normal" } }, false, {})
+    end
+  end
 end
 
 -- Async HTTP helpers (curl-based)
@@ -155,12 +187,14 @@ mutation ($group: String!, $file: String!, $root: String!, $loc: Int!) {
 local function download_group_async(group_name, on_done)
   if inflight_by_group[group_name] then return end
   inflight_by_group[group_name] = true
+  download_progress[group_name] = nil
   vim.notify("Retrieves: downloading locations for " .. group_name .. "...", vim.log.levels.INFO)
 
   make_request_async(GET_FINDING_ID, { group = group_name }, function(root_data, err)
     if not root_data then
       inflight_by_group[group_name] = nil
       vim.notify("Retrieves: failed to list findings: " .. tostring(err), vim.log.levels.ERROR)
+      download_progress[group_name] = nil
       if on_done then on_done(nil, err) end
       return
     end
@@ -177,13 +211,21 @@ local function download_group_async(group_name, on_done)
       end
 
       local findings = root_data.group.findings or {}
+      local total_findings = #findings
       local i = 1
+
+      if total_findings > 0 then
+        notify_progress(group_name, 0, total_findings)
+      end
 
       local function process_next_finding()
         if i > #findings then
           local out = { reported = reported, drafts = pending, roots = roots, org = organization }
           cache_by_group[group_name] = out
           inflight_by_group[group_name] = nil
+          if total_findings > 0 then
+            notify_progress(group_name, total_findings, total_findings)
+          end
           vim.notify("Retrieves: download complete for " .. group_name, vim.log.levels.INFO)
           if on_done then on_done(out, nil) end
           return
@@ -251,6 +293,9 @@ local function download_group_async(group_name, on_done)
             if vulnHasNext or draftHasNext then
               page_once()
             else
+              if total_findings > 0 then
+                notify_progress(group_name, i - 1, total_findings)
+              end
               process_next_finding()
             end
           end)
@@ -263,6 +308,7 @@ local function download_group_async(group_name, on_done)
     else
       inflight_by_group[group_name] = nil
       vim.notify("Retrieves: group not found", vim.log.levels.ERROR)
+      download_progress[group_name] = nil
       if on_done then on_done(nil, "group not found") end
     end
   end)
@@ -324,7 +370,7 @@ local function ensure_group_entry(group)
     end
   end
 
-  return entry, err or "root id unavailable"
+  return cache_by_group[group.name], err or "root id unavailable"
 end
 
 local function clear(buf)
@@ -529,9 +575,12 @@ function M.setup()
       end)
     end
 
-    local entry = ensure_group_entry(group)
-    entry = entry and cache_by_group[group.name] or entry
-    local root_id = entry and entry.roots and entry.roots[group.nickname]
+    local entry, err = ensure_group_entry(group)
+    if not entry then
+      vim.notify("Retrieves: " .. (err or "root data unavailable"), vim.log.levels.ERROR)
+      return
+    end
+    local root_id = entry.roots and entry.roots[group.nickname]
     if root_id then
       submit_request(root_id)
       return
