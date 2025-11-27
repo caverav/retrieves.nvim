@@ -14,6 +14,11 @@ local cache_by_group = {}
 local inflight_by_group = {}
 local download_progress = {}
 
+local function new_progress_state()
+  local step = tonumber(vim.g.retrieves_progress_step or 10) or 10
+  return { last_percent = -step, done = 0, total = 0 }
+end
+
 local function define_default_hls()
   -- Allow override via globals; fall back to readable tints similar to VS Code rgba fills.
   local rep = vim.g.retrieves_reported_bg or "#FFE5E6" -- soft red tint
@@ -58,9 +63,11 @@ local function notify_progress(group_name, done, total)
   local step = tonumber(vim.g.retrieves_progress_step or 10) or 10
   local state = download_progress[group_name]
   if not state then
-    state = { last_percent = -step }
+    state = new_progress_state()
     download_progress[group_name] = state
   end
+  state.done = math.min(done, total)
+  state.total = total
   if done == total then
     download_progress[group_name] = nil
   end
@@ -187,7 +194,7 @@ mutation ($group: String!, $file: String!, $root: String!, $loc: Int!) {
 local function download_group_async(group_name, on_done)
   if inflight_by_group[group_name] then return end
   inflight_by_group[group_name] = true
-  download_progress[group_name] = nil
+  download_progress[group_name] = new_progress_state()
   vim.notify("Retrieves: downloading locations for " .. group_name .. "...", vim.log.levels.INFO)
 
   make_request_async(GET_FINDING_ID, { group = group_name }, function(root_data, err)
@@ -214,6 +221,11 @@ local function download_group_async(group_name, on_done)
       local total_findings = #findings
       local i = 1
 
+      local state = download_progress[group_name] or new_progress_state()
+      state.total = total_findings
+      state.done = 0
+      download_progress[group_name] = state
+
       if total_findings > 0 then
         notify_progress(group_name, 0, total_findings)
       end
@@ -223,6 +235,7 @@ local function download_group_async(group_name, on_done)
           local out = { reported = reported, drafts = pending, roots = roots, org = organization }
           cache_by_group[group_name] = out
           inflight_by_group[group_name] = nil
+          download_progress[group_name] = nil
           if total_findings > 0 then
             notify_progress(group_name, total_findings, total_findings)
           end
@@ -348,6 +361,30 @@ local function snapshot_path_for(group)
     or (group.repo_path .. "/retrieves-vulns-" .. group.name .. ".json")
 end
 
+local function merge_snapshot_into_entry(entry, snapshot)
+  if not snapshot then return entry end
+  entry = entry or {}
+  entry.reported = snapshot.reported or entry.reported or {}
+  entry.drafts = snapshot.drafts or entry.drafts or {}
+  entry.roots = snapshot.roots or entry.roots or {}
+  entry.org = snapshot.org or entry.org or ""
+  return entry
+end
+
+local function cached_entry_for_group(group)
+  if not group then return nil end
+  local entry = cache_by_group[group.name]
+  if entry then return entry end
+
+  local snapshot, _ = load_snapshot(snapshot_path_for(group))
+  if snapshot then
+    entry = merge_snapshot_into_entry(entry, snapshot)
+    cache_by_group[group.name] = entry
+    return entry
+  end
+  return nil
+end
+
 local function ensure_group_entry(group)
   if not group then
     return nil, "group not detected"
@@ -359,11 +396,7 @@ local function ensure_group_entry(group)
 
   local snapshot, err = load_snapshot(snapshot_path_for(group))
   if snapshot then
-    entry = entry or {}
-    entry.reported = entry.reported or snapshot.reported or {}
-    entry.drafts = entry.drafts or snapshot.drafts or {}
-    entry.roots = snapshot.roots or entry.roots or {}
-    entry.org = snapshot.org or entry.org or ""
+    entry = merge_snapshot_into_entry(entry, snapshot)
     cache_by_group[group.name] = entry
     if entry.roots and entry.roots[group.nickname] then
       return entry, nil
@@ -395,11 +428,7 @@ local function apply(buf)
   local snapshot, err = load_snapshot(snapshot_path)
   local entry = cache_by_group[group.name]
   if snapshot then
-    entry = entry or {}
-    entry.reported = snapshot.reported or entry.reported or {}
-    entry.drafts = snapshot.drafts or entry.drafts or {}
-    entry.roots = snapshot.roots or entry.roots or {}
-    entry.org = snapshot.org or entry.org or ""
+    entry = merge_snapshot_into_entry(entry, snapshot)
     cache_by_group[group.name] = entry
   elseif entry then
     -- nothing more to do; we'll rely on cached data
@@ -497,6 +526,57 @@ local function apply(buf)
       })
     end
   end
+end
+
+local function count_locations_for_file(entries)
+  local total = 0
+  if not entries then return 0 end
+  for _, entry in pairs(entries) do
+    if type(entry) == "table" and type(entry.locs) == "table" then
+      total = total + #entry.locs
+    else
+      total = total + 1
+    end
+  end
+  return total
+end
+
+function M.lualine_component()
+  local buf = vim.api.nvim_get_current_buf()
+  local name = vim.api.nvim_buf_get_name(buf)
+  if name == "" then return "" end
+
+  local group = detect_group(name)
+  if not group then
+    return ""
+  end
+
+  if inflight_by_group[group.name] then
+    local state = download_progress[group.name]
+    local total = (state and state.total) or 0
+    local done = (state and state.done) or 0
+    if total > 0 then
+      done = math.min(done, total)
+      local percent = math.floor((done / total) * 100)
+      return string.format("Retrieves %s %d%% (%d/%d)", group.name, percent, done, total)
+    end
+    return string.format("Retrieves %s downloading", group.name)
+  end
+
+  local entry = cached_entry_for_group(group)
+  if not entry then
+    return ""
+  end
+
+  local key = group.current_file
+  local reported = count_locations_for_file((entry.reported or {})[key])
+  local drafts = count_locations_for_file((entry.drafts or {})[key])
+
+  if reported + drafts == 0 then
+    return ""
+  end
+
+  return string.format("Vulns R:%d P:%d", reported, drafts)
 end
 
 function M.refresh()
