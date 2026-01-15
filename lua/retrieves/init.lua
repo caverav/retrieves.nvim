@@ -13,6 +13,7 @@ local sign_group  = "retrieves_signs"
 local cache_by_group = {}
 local inflight_by_group = {}
 local download_progress = {}
+local auto_attack_done = {}
 
 local function new_progress_state()
   local step = tonumber(vim.g.retrieves_progress_step or 10) or 10
@@ -188,6 +189,69 @@ local function make_request_async(query, variables, cb)
   end)
 end
 
+local function make_upload_request_async(query, variables, file_content, file_name, cb)
+  local token = vim.g.retrieves_token or vim.env.INTEGRATES_API_TOKEN
+  if not token or token == "" then
+    cb(nil, "INTEGRATES_API_TOKEN not set")
+    return
+  end
+
+  local tmpfile = vim.fn.tempname()
+  local lines = vim.split(file_content or "", "\n", { plain = true })
+  pcall(vim.fn.writefile, lines, tmpfile)
+
+  local operations = vim.json.encode({ query = query, variables = vim.tbl_extend("force", variables or {}, { file = nil }) })
+  local map = vim.json.encode({ ["0"] = { "variables.file" } })
+
+  local cmd = { "curl", "-sS", "-X", "POST", endpoint, "-H", "authorization: Bearer " .. token }
+  vim.list_extend(cmd, { "-F", "operations=" .. operations })
+  vim.list_extend(cmd, { "-F", "map=" .. map })
+  vim.list_extend(cmd, { "-F", string.format("0=@%s;type=application/x-yaml;filename=%s", tmpfile, file_name or "report_nvim.yaml") })
+
+  local function finish(ok, out)
+    pcall(function() vim.fn.delete(tmpfile) end)
+    if not ok then
+      cb(nil, out or "request failed")
+      return
+    end
+    local ok2, json = pcall(vim.json.decode, out)
+    if not ok2 then
+      cb(nil, "invalid json response")
+      return
+    end
+    if json.errors then
+      cb(nil, vim.inspect(json.errors))
+      return
+    end
+    cb(json.data, nil)
+  end
+
+  if type(vim.system) == "function" then
+    vim.system(cmd, { text = true }, function(obj)
+      local ok = obj.code == 0
+      local out = (obj.stdout and obj.stdout ~= '') and obj.stdout or (obj.stderr or '')
+      vim.schedule(function() finish(ok, out) end)
+    end)
+  else
+    local stdout, stderr = {}, {}
+    vim.fn.jobstart(cmd, {
+      stdout_buffered = true,
+      stderr_buffered = true,
+      on_stdout = function(_, data)
+        if data and #data > 0 then table.insert(stdout, table.concat(data, "\n")) end
+      end,
+      on_stderr = function(_, data)
+        if data and #data > 0 then table.insert(stderr, table.concat(data, "\n")) end
+      end,
+      on_exit = function(_, code)
+        local ok = code == 0
+        local out = table.concat(ok and stdout or stderr, "")
+        vim.schedule(function() finish(ok, out) end)
+      end,
+    })
+  end
+end
+
 local GET_FINDING_ID = [[
 query GetFindingsIDS($group: String!){
   group(groupName: $group) {
@@ -226,6 +290,21 @@ mutation ($group: String!, $file: String!, $root: String!, $loc: Int!) {
     attackedLines: $loc,
     comments: ""
   ) {
+    success
+  }
+}
+]]
+
+local GET_ME = [[
+query {
+  me { userEmail }
+}
+]]
+
+local UPLOAD_VULNERABILITIES = [[
+mutation ($file: Upload!, $findingId: String!) {
+  uploadFile(findingId: $findingId, file: $file) {
+    message
     success
   }
 }
@@ -475,6 +554,8 @@ local function clear(buf)
   end
 end
 
+local maybe_auto_attack
+
 local function apply(buf)
   if not vim.api.nvim_buf_is_loaded(buf) then return end
   local name = vim.api.nvim_buf_get_name(buf)
@@ -578,6 +659,10 @@ local function apply(buf)
       })
     end
   end
+
+  if maybe_auto_attack then
+    maybe_auto_attack(buf, group, entry)
+  end
 end
 
 local function count_locations_for_file(entries)
@@ -591,6 +676,456 @@ local function count_locations_for_file(entries)
     end
   end
   return total
+end
+
+local function submit_attack(buf, group, root_id, silent)
+  if not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local attacked = math.max(vim.api.nvim_buf_line_count(buf) - 1, 0)
+  make_request_async(UPDATE_ATTACKED_TOE, {
+    group = group.name,
+    file = group.filename,
+    root = root_id,
+    loc = attacked,
+  }, function(data, req_err)
+    if not data then
+      vim.notify("Retrieves: failed to mark attacked: " .. tostring(req_err), vim.log.levels.ERROR)
+      return
+    end
+    local ok = data.updateToeLinesAttackedLines and data.updateToeLinesAttackedLines.success
+    if ok then
+      if not silent then
+        vim.notify("Retrieves: file marked as attacked", vim.log.levels.INFO)
+      end
+    else
+      vim.notify("Retrieves: failed to mark attacked", vim.log.levels.ERROR)
+    end
+  end)
+end
+
+maybe_auto_attack = function(buf, group, entry)
+  if vim.g.retrieves_auto_attack ~= true then
+    return
+  end
+  if not group or not entry or not entry.roots then
+    return
+  end
+  if auto_attack_done[group.current_file] then
+    return
+  end
+  local root_id = entry.roots[group.nickname]
+  if not root_id then
+    return
+  end
+  auto_attack_done[group.current_file] = true
+  submit_attack(buf, group, root_id, true)
+end
+
+local function get_last_commit(path)
+  if not path or path == "" then
+    return ""
+  end
+  if type(vim.system) == "function" then
+    local res = vim.system(
+      { "git", "log", "-n", "1", "--pretty=format:%H", "--" },
+      { text = true, cwd = path }
+    ):wait()
+    if res and res.code == 0 then
+      return (res.stdout or ""):gsub("%s+$", "")
+    end
+  end
+  local out = vim.fn.system({ "git", "-C", path, "log", "-n", "1", "--pretty=format:%H", "--" })
+  if vim.v.shell_error == 0 then
+    return (out or ""):gsub("%s+$", "")
+  end
+  return ""
+end
+
+local function parse_yaml_entries(content)
+  local entries = {}
+  local current = nil
+  local lines = vim.split(content or "", "\n", { plain = true })
+  for _, line in ipairs(lines) do
+    if line:match("^%s*lines:%s*$") then
+      current = nil
+    elseif line:match("^%s*%-") then
+      current = {}
+      table.insert(entries, current)
+      local inline = line:gsub("^%s*%-", ""):gsub("^%s*", "")
+      local key, value = inline:match("^([%w_]+)%s*:%s*(.*)$")
+      if key then
+        value = value:gsub("^['\"]", ""):gsub("['\"]$", "")
+        current[key] = value
+      end
+    elseif current then
+      local key, value = line:match("^%s*([%w_]+)%s*:%s*(.*)$")
+      if key then
+        value = value:gsub("^['\"]", ""):gsub("['\"]$", "")
+        current[key] = value
+      end
+    end
+  end
+  return entries
+end
+
+local function dump_yaml_entries(entries)
+  local out = { "lines:" }
+  for _, entry in ipairs(entries) do
+    table.insert(out, string.format("- commit_hash: %s", entry.commit_hash or ""))
+    table.insert(out, string.format("  line: '%s'", entry.line or ""))
+    table.insert(out, string.format("  path: %s", entry.path or ""))
+    table.insert(out, string.format("  repo_nickname: %s", entry.repo_nickname or ""))
+    table.insert(out, string.format("  source: %s", entry.source or "analyst"))
+    table.insert(out, "  state: submitted")
+    table.insert(out, "  tool:")
+    table.insert(out, "    impact: direct")
+    table.insert(out, "    name: none")
+  end
+  return table.concat(out, "\n") .. "\n"
+end
+
+local function add_line_to_yaml(yaml_path, nickname, filepath, commit, line, source)
+  local ok, data = pcall(vim.fn.readfile, yaml_path)
+  local content = ok and table.concat(data, "\n") or ""
+  local entries = parse_yaml_entries(content)
+  local line_str = tostring(line)
+  local max_per_entry = tonumber(vim.g.retrieves_max_yaml_lines_per_entry or 100) or 100
+  local pushed = false
+
+  for _, entry in ipairs(entries) do
+    if entry.path == filepath and entry.repo_nickname == nickname then
+      local existing = entry.line or ""
+      local parts = vim.split(existing, ",", { plain = true, trimempty = true })
+      if #parts <= max_per_entry then
+        table.insert(parts, line_str)
+        entry.line = table.concat(parts, ",")
+        pushed = true
+        break
+      end
+    end
+  end
+
+  if not pushed then
+    table.insert(entries, {
+      commit_hash = commit,
+      line = line_str,
+      path = filepath,
+      repo_nickname = nickname,
+      source = source or "analyst",
+      state = "submitted",
+      tool = { impact = "direct", name = "none" },
+    })
+  end
+
+  local dumped = dump_yaml_entries(entries)
+  local out_lines = vim.split(dumped, "\n", { plain = true })
+  local ok2, err = pcall(vim.fn.writefile, out_lines, yaml_path)
+  if not ok2 then
+    vim.notify("Retrieves: failed to write yaml: " .. tostring(err), vim.log.levels.ERROR)
+  end
+end
+
+local function absolute_path_for(group, file_path)
+  if not file_path or file_path == "" then return nil end
+  if vim.fn.fnamemodify(file_path, ":p") == file_path then
+    return file_path
+  end
+  local parent = group.repo_path and group.repo_path:match("(.+)/[^/]+$") or nil
+  if parent then
+    return vim.fs.normalize(parent .. "/" .. file_path)
+  end
+  return vim.fs.normalize(file_path)
+end
+
+local function open_location(group, file_path, line)
+  local path = absolute_path_for(group, file_path)
+  if not path then return end
+  vim.cmd("edit " .. vim.fn.fnameescape(path))
+  local ln = tonumber(line) or 1
+  if ln < 1 then ln = 1 end
+  vim.api.nvim_win_set_cursor(0, { ln, 0 })
+end
+
+local function telescope_available()
+  return pcall(require, "telescope.pickers")
+end
+
+local function use_telescope_picker()
+  return vim.g.retrieves_picker ~= "buffer" and telescope_available()
+end
+
+local function buffer_select(items, opts, on_select)
+  vim.cmd("vsplit")
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(win, buf)
+  vim.api.nvim_win_set_width(win, math.max(40, math.floor(vim.o.columns * 0.3)))
+
+  vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+  vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
+  vim.api.nvim_buf_set_option(buf, "swapfile", false)
+  vim.api.nvim_buf_set_option(buf, "modifiable", true)
+  vim.api.nvim_buf_set_option(buf, "filetype", "retrieves-picker")
+
+  local title = opts and opts.prompt or "Select"
+  local lines = { " " .. title, string.rep("─", #title + 2) }
+  for i, item in ipairs(items) do
+    local label = item.display or item.label or tostring(i)
+    table.insert(lines, string.format("%2d. %s", i, label))
+  end
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_option(buf, "modifiable", false)
+  vim.api.nvim_win_set_cursor(win, { 3, 0 })
+
+  vim.keymap.set("n", "q", function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end, { buffer = buf, silent = true })
+
+  vim.keymap.set("n", "<CR>", function()
+    local cursor = vim.api.nvim_win_get_cursor(win)[1]
+    local index = cursor - 2
+    if index >= 1 and index <= #items then
+      local choice = items[index]
+      if vim.api.nvim_win_is_valid(win) then
+        vim.api.nvim_win_close(win, true)
+      end
+      on_select(choice)
+    end
+  end, { buffer = buf, silent = true })
+end
+
+local function open_tree_view(nodes, title, group, main_win)
+  vim.cmd("vsplit")
+  local win = vim.api.nvim_get_current_win()
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(win, buf)
+  vim.api.nvim_win_set_width(win, math.max(40, math.floor(vim.o.columns * 0.35)))
+
+  vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+  vim.api.nvim_buf_set_option(buf, "bufhidden", "wipe")
+  vim.api.nvim_buf_set_option(buf, "swapfile", false)
+  vim.api.nvim_buf_set_option(buf, "modifiable", true)
+  vim.api.nvim_buf_set_option(buf, "filetype", "retrieves-tree")
+
+  local line_to_node = {}
+
+  local function render(keep_node)
+    local prev_line = 3
+    if vim.api.nvim_win_is_valid(win) then
+      prev_line = vim.api.nvim_win_get_cursor(win)[1]
+    end
+    local prev_node = keep_node
+    if not prev_node then
+      prev_node = line_to_node[prev_line]
+    end
+
+    local lines = { " " .. title, string.rep("─", #title + 2) }
+    line_to_node = {}
+
+    local function add_node(node)
+      local indent = string.rep("  ", node.depth or 0)
+      local prefix = "  "
+      if node.children and #node.children > 0 then
+        prefix = node.expanded and "▾ " or "▸ "
+      end
+      table.insert(lines, indent .. prefix .. (node.label or ""))
+      line_to_node[#lines] = node
+      if node.expanded and node.children then
+        for _, child in ipairs(node.children) do
+          add_node(child)
+        end
+      end
+    end
+
+    for _, node in ipairs(nodes) do
+      add_node(node)
+    end
+
+    vim.api.nvim_buf_set_option(buf, "modifiable", true)
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+    vim.api.nvim_buf_set_option(buf, "modifiable", false)
+
+    local target_line = math.min(prev_line, #lines)
+    if prev_node then
+      for idx, node in pairs(line_to_node) do
+        if node == prev_node then
+          target_line = idx
+          break
+        end
+      end
+    end
+    vim.api.nvim_win_set_cursor(win, { target_line, 0 })
+  end
+
+  render()
+
+  local function preview_node(node, focus)
+    if not node or not node.file or not node.line then
+      return
+    end
+    if not main_win or not vim.api.nvim_win_is_valid(main_win) then
+      return
+    end
+    local path = absolute_path_for(group, node.file)
+    if not path then return end
+    vim.api.nvim_win_call(main_win, function()
+      vim.cmd("edit " .. vim.fn.fnameescape(path))
+      local ln = tonumber(node.line) or 1
+      if ln < 1 then ln = 1 end
+      vim.api.nvim_win_set_cursor(0, { ln, 0 })
+    end)
+    if focus then
+      vim.api.nvim_set_current_win(main_win)
+    end
+  end
+
+  vim.api.nvim_create_autocmd("CursorMoved", {
+    buffer = buf,
+    callback = function()
+      local cursor = vim.api.nvim_win_get_cursor(win)[1]
+      local node = line_to_node[cursor]
+      preview_node(node, false)
+    end,
+  })
+
+  vim.keymap.set("n", "q", function()
+    if vim.api.nvim_win_is_valid(win) then
+      vim.api.nvim_win_close(win, true)
+    end
+  end, { buffer = buf, silent = true })
+
+  vim.keymap.set("n", "<CR>", function()
+    local cursor = vim.api.nvim_win_get_cursor(win)[1]
+    local node = line_to_node[cursor]
+    if not node then
+      return
+    end
+    if node.children and #node.children > 0 then
+      node.expanded = not node.expanded
+      render()
+      return
+    end
+    preview_node(node, true)
+  end, { buffer = buf, silent = true })
+
+  vim.keymap.set("n", "l", function()
+    local cursor = vim.api.nvim_win_get_cursor(win)[1]
+    local node = line_to_node[cursor]
+    if not node then
+      return
+    end
+    if node.children and #node.children > 0 then
+      if not node.expanded then
+        node.expanded = true
+        render()
+      end
+      return
+    end
+    preview_node(node, true)
+  end, { buffer = buf, silent = true })
+
+  vim.keymap.set("n", "h", function()
+    local cursor = vim.api.nvim_win_get_cursor(win)[1]
+    local node = line_to_node[cursor]
+    if not node then
+      return
+    end
+    if node.children and #node.children > 0 and node.expanded then
+      node.expanded = false
+      render()
+    end
+  end, { buffer = buf, silent = true })
+end
+
+local function select_from_list(items, opts, on_select, picker)
+  if not items or #items == 0 then
+    vim.notify("Retrieves: no entries available", vim.log.levels.INFO)
+    return
+  end
+  opts = opts or {}
+  if picker == "telescope" or (not picker and use_telescope_picker()) then
+    local pickers = require("telescope.pickers")
+    local finders = require("telescope.finders")
+    local conf = require("telescope.config").values
+    local actions = require("telescope.actions")
+    local action_state = require("telescope.actions.state")
+    pickers.new({}, {
+      prompt_title = opts.prompt or "Select",
+      finder = finders.new_table({
+        results = items,
+        entry_maker = function(item)
+          return {
+            value = item,
+            display = item.display or item.label,
+            ordinal = item.ordinal or item.label,
+          }
+        end,
+      }),
+      sorter = conf.generic_sorter({}),
+      attach_mappings = function(prompt_bufnr)
+        actions.select_default:replace(function()
+          local selection = action_state.get_selected_entry()
+          actions.close(prompt_bufnr)
+          if selection and selection.value then
+            on_select(selection.value)
+          end
+        end)
+        return true
+      end,
+    }):find()
+  elseif picker == "buffer" or vim.g.retrieves_picker == "buffer" then
+    buffer_select(items, opts, on_select)
+  else
+    vim.ui.select(items, {
+      prompt = opts.prompt or "Select",
+      format_item = function(item)
+        return item.display or item.label
+      end,
+    }, function(choice)
+      if choice then
+        on_select(choice)
+      end
+    end)
+  end
+end
+
+local function pick_yaml_file(cwd, on_select)
+  if use_telescope_picker() then
+    local ok, builtin = pcall(require, "telescope.builtin")
+    if ok then
+      local find_command = nil
+      if vim.fn.executable("rg") == 1 then
+        find_command = { "rg", "--files", "-g", "*.yml", "-g", "*.yaml" }
+      end
+      builtin.find_files({
+        cwd = cwd,
+        prompt_title = "Select YAML report",
+        find_command = find_command,
+        attach_mappings = function(prompt_bufnr)
+          local actions = require("telescope.actions")
+          local action_state = require("telescope.actions.state")
+          actions.select_default:replace(function()
+            local selection = action_state.get_selected_entry()
+            actions.close(prompt_bufnr)
+            if selection and selection.path then
+              on_select(selection.path)
+            end
+          end)
+          return true
+        end,
+      })
+      return
+    end
+  end
+
+  vim.ui.input({ prompt = "YAML path", default = cwd and (cwd .. "/") or "" }, function(input)
+    if input and input ~= "" then
+      on_select(input)
+    end
+  end)
 end
 
 function M.lualine_component()
@@ -641,6 +1176,22 @@ function M.setup()
   -- Define signs (thin bar). Do once; harmless if redefined.
   pcall(vim.fn.sign_define, 'retrieves_reported', { text = '▎', texthl = 'RetrievesReportedSign', numhl = '' })
   pcall(vim.fn.sign_define, 'retrieves_pending',  { text = '▎', texthl = 'RetrievesPendingSign',  numhl = '' })
+  if vim.g.retrieves_verify_token ~= false then
+    local token = vim.g.retrieves_token or vim.env.INTEGRATES_API_TOKEN
+    if token and token ~= "" then
+      make_request_async(GET_ME, {}, function(data, err)
+        if data and data.me and data.me.userEmail then
+          vim.notify("Retrieves active. Logged in as: " .. data.me.userEmail, vim.log.levels.INFO)
+        else
+          vim.notify("Retrieves Error: Invalid INTEGRATES_API_TOKEN or API connection failed.", vim.log.levels.ERROR)
+        end
+      end)
+    else
+      vim.notify("Retrieves Error: INTEGRATES_API_TOKEN not found in environment.", vim.log.levels.ERROR)
+    end
+  end
+
+  local reporting_dir = vim.loop.os_homedir()
   vim.api.nvim_create_user_command("RetrievesRefresh", function()
     M.refresh()
   end, {})
@@ -675,30 +1226,6 @@ function M.setup()
       return
     end
 
-    local function submit_request(root_id)
-      if not vim.api.nvim_buf_is_valid(buf) then
-        return
-      end
-      local attacked = math.max(vim.api.nvim_buf_line_count(buf) - 1, 0)
-      make_request_async(UPDATE_ATTACKED_TOE, {
-        group = group.name,
-        file = group.filename,
-        root = root_id,
-        loc = attacked,
-      }, function(data, req_err)
-        if not data then
-          vim.notify("Retrieves: failed to mark attacked: " .. tostring(req_err), vim.log.levels.ERROR)
-          return
-        end
-        local ok = data.updateToeLinesAttackedLines and data.updateToeLinesAttackedLines.success
-        if ok then
-          vim.notify("Retrieves: file marked as attacked", vim.log.levels.INFO)
-        else
-          vim.notify("Retrieves: failed to mark attacked", vim.log.levels.ERROR)
-        end
-      end)
-    end
-
     local entry, err = ensure_group_entry(group)
     if not entry then
       vim.notify("Retrieves: " .. (err or "root data unavailable"), vim.log.levels.ERROR)
@@ -706,7 +1233,7 @@ function M.setup()
     end
     local root_id = entry.roots and entry.roots[group.nickname]
     if root_id then
-      submit_request(root_id)
+      submit_attack(buf, group, root_id, false)
       return
     end
 
@@ -725,7 +1252,7 @@ function M.setup()
         vim.notify("Retrieves: root id not found for " .. group.current_file, vim.log.levels.ERROR)
         return
       end
-      submit_request(rid)
+      submit_attack(buf, group, rid, false)
     end)
   end, {})
 
@@ -789,6 +1316,479 @@ function M.setup()
       vim.fn.jobstart({ opener, entry.url }, { detach = true })
     end
   end, {})
+
+  local function current_group_entry()
+    local buf = vim.api.nvim_get_current_buf()
+    local name = vim.api.nvim_buf_get_name(buf)
+    if name == "" then
+      return nil, nil, buf
+    end
+    local group = detect_group(name)
+    if not group then
+      return nil, nil, buf
+    end
+    local entry = cached_entry_for_group(group)
+    return group, entry, buf
+  end
+
+  local function ensure_entry_or_notify(group, entry)
+    if entry then
+      return true
+    end
+    local token = vim.g.retrieves_token or vim.env.INTEGRATES_API_TOKEN
+    if token and token ~= "" then
+      vim.notify("Retrieves: data not loaded yet, run :RetrievesDownload", vim.log.levels.INFO)
+    else
+      vim.notify("Retrieves: INTEGRATES_API_TOKEN not set", vim.log.levels.ERROR)
+    end
+    return false
+  end
+
+  local function build_file_items(reported)
+    local items = {}
+    for file, vulns in pairs(reported or {}) do
+      local count = count_locations_for_file(vulns)
+      table.insert(items, {
+        label = file,
+        display = string.format("%s (%d)", file, count),
+        file = file,
+        vulns = vulns,
+      })
+    end
+    table.sort(items, function(a, b) return a.label < b.label end)
+    return items
+  end
+
+local function build_tree_by_file(group, reported)
+  local file_cache = {}
+  local function line_text(file, line)
+    if not file_cache[file] then
+      local path = absolute_path_for(group, file)
+      if not path then
+        file_cache[file] = false
+      else
+        local ok, data = pcall(vim.fn.readfile, path)
+        file_cache[file] = ok and data or false
+      end
+    end
+    local lines = file_cache[file]
+    if not lines or not lines[line] then
+      return ""
+    end
+    return lines[line]
+  end
+
+  local nodes = {}
+  local files = {}
+  for file, vulns in pairs(reported or {}) do
+    table.insert(files, { file = file, vulns = vulns })
+  end
+  table.sort(files, function(a, b)
+    if a.file == group.current_file then
+      return true
+    end
+    if b.file == group.current_file then
+      return false
+    end
+    return a.file < b.file
+  end)
+  for _, f in ipairs(files) do
+    local file_node = { kind = "file", depth = 0, label = f.file, expanded = false, children = {} }
+    local titles = {}
+    for title, data in pairs(f.vulns or {}) do
+      table.insert(titles, { title = title, data = data })
+    end
+    table.sort(titles, function(a, b) return a.title < b.title end)
+    for _, t in ipairs(titles) do
+      local count = t.data.locs and #t.data.locs or 0
+      local vuln_node = {
+        kind = "vuln",
+        depth = 1,
+        label = string.format("%s (%d)", t.title, count),
+        expanded = false,
+        children = {},
+      }
+      local locs = t.data.locs or {}
+      table.sort(locs, function(a, b) return tonumber(a) < tonumber(b) end)
+      for _, line in ipairs(locs) do
+        local text = line_text(f.file, tonumber(line) or line) or ""
+        local label = string.format("%s: %s", tostring(line), text)
+        table.insert(vuln_node.children, {
+          kind = "line",
+          depth = 2,
+          label = label,
+          file = f.file,
+          line = line,
+        })
+      end
+      table.insert(file_node.children, vuln_node)
+    end
+    table.insert(nodes, file_node)
+  end
+  return nodes
+end
+
+local function build_tree_by_type(group, reported)
+  local file_cache = {}
+  local function line_text(file, line)
+    if not file_cache[file] then
+      local path = absolute_path_for(group, file)
+      if not path then
+        file_cache[file] = false
+      else
+        local ok, data = pcall(vim.fn.readfile, path)
+        file_cache[file] = ok and data or false
+      end
+    end
+    local lines = file_cache[file]
+    if not lines or not lines[line] then
+      return ""
+    end
+    return lines[line]
+  end
+
+  local grouped = {}
+  for file, vulns in pairs(reported or {}) do
+      for title, data in pairs(vulns or {}) do
+        grouped[title] = grouped[title] or {}
+        table.insert(grouped[title], { file = file, data = data })
+      end
+    end
+  local nodes = {}
+  local titles = {}
+  for title, entries in pairs(grouped) do
+    table.insert(titles, { title = title, entries = entries })
+  end
+  table.sort(titles, function(a, b) return a.title < b.title end)
+  for _, t in ipairs(titles) do
+    local type_node = {
+      kind = "type",
+      depth = 0,
+      label = string.format("%s (%d files)", t.title, #t.entries),
+      expanded = false,
+      children = {},
+    }
+    table.sort(t.entries, function(a, b) return a.file < b.file end)
+    for _, entry in ipairs(t.entries) do
+      local count = entry.data.locs and #entry.data.locs or 0
+      local file_node = {
+        kind = "file",
+        depth = 1,
+        label = string.format("%s (%d)", entry.file, count),
+        expanded = false,
+        children = {},
+      }
+      local locs = entry.data.locs or {}
+      table.sort(locs, function(a, b) return tonumber(a) < tonumber(b) end)
+      for _, line in ipairs(locs) do
+        local text = line_text(entry.file, tonumber(line) or line) or ""
+        local label = string.format("%s: %s", tostring(line), text)
+        table.insert(file_node.children, {
+          kind = "line",
+          depth = 2,
+          label = label,
+          file = entry.file,
+          line = line,
+        })
+      end
+      table.insert(type_node.children, file_node)
+    end
+    table.insert(nodes, type_node)
+  end
+  return nodes
+end
+
+  local function build_vuln_items(vulns)
+    local items = {}
+    for title, data in pairs(vulns or {}) do
+      local count = data.locs and #data.locs or 0
+      table.insert(items, {
+        label = title,
+        display = string.format("%s (%d)", title, count),
+        vuln = data,
+      })
+    end
+    table.sort(items, function(a, b) return a.label < b.label end)
+    return items
+  end
+
+  local function build_line_items(locs)
+    local items = {}
+    table.sort(locs or {}, function(a, b) return tonumber(a) < tonumber(b) end)
+    for _, line in ipairs(locs or {}) do
+      table.insert(items, {
+        label = tostring(line),
+        display = "Line " .. tostring(line),
+        line = line,
+      })
+    end
+    return items
+  end
+
+  local function build_type_groups(reported)
+    local grouped = {}
+    for file, vulns in pairs(reported or {}) do
+      for title, data in pairs(vulns) do
+        grouped[title] = grouped[title] or {}
+        table.insert(grouped[title], { file = file, vuln = data })
+      end
+    end
+    local items = {}
+    for title, entries in pairs(grouped) do
+      table.insert(items, {
+        label = title,
+        display = string.format("%s (%d files)", title, #entries),
+        title = title,
+        entries = entries,
+      })
+    end
+    table.sort(items, function(a, b) return a.label < b.label end)
+    return items
+  end
+
+  vim.api.nvim_create_user_command("RetrievesForce", function()
+    local buf = vim.api.nvim_get_current_buf()
+    local name = vim.api.nvim_buf_get_name(buf)
+    local group = detect_group(name)
+    if not group then
+      vim.notify("Retrieves: not a group file", vim.log.levels.WARN)
+      return
+    end
+    download_group_async(group.name, function(res, err)
+      if not res then return end
+      write_snapshot_for_group(group, res)
+      if vim.api.nvim_buf_is_valid(buf) then M.refresh() end
+    end)
+  end, {})
+
+  local function findings_by_file(picker)
+    local group, entry = current_group_entry()
+    if not group or not ensure_entry_or_notify(group, entry) then
+      return
+    end
+    if picker == "buffer" then
+      local nodes = build_tree_by_file(group, entry.reported or {})
+      local main_win = vim.api.nvim_get_current_win()
+      open_tree_view(nodes, "Findings by file", group, main_win)
+      return
+    end
+    local files = build_file_items(entry.reported or {})
+    select_from_list(files, { prompt = "Findings by file" }, function(file_item)
+      local vulns = build_vuln_items(file_item.vulns)
+      select_from_list(vulns, { prompt = file_item.label }, function(vuln_item)
+        local lines = build_line_items(vuln_item.vuln.locs or {})
+        select_from_list(lines, { prompt = vuln_item.label }, function(line_item)
+          open_location(group, file_item.file, line_item.line)
+        end, picker)
+      end, picker)
+    end, picker)
+  end
+
+  vim.api.nvim_create_user_command("RetrievesFindingsByFile", function()
+    findings_by_file("buffer")
+  end, {})
+
+  vim.api.nvim_create_user_command("RetrievesFindingsByFileBuffer", function()
+    findings_by_file("buffer")
+  end, {})
+
+  vim.api.nvim_create_user_command("RetrievesFindingsByFileTelescope", function()
+    findings_by_file("telescope")
+  end, {})
+
+  local function findings_by_type(picker)
+    local group, entry = current_group_entry()
+    if not group or not ensure_entry_or_notify(group, entry) then
+      return
+    end
+    if picker == "buffer" then
+      local nodes = build_tree_by_type(group, entry.reported or {})
+      local main_win = vim.api.nvim_get_current_win()
+      open_tree_view(nodes, "Findings by typology", group, main_win)
+      return
+    end
+    local types = build_type_groups(entry.reported or {})
+    select_from_list(types, { prompt = "Findings by typology" }, function(type_item)
+      local file_items = {}
+      for _, t in ipairs(type_item.entries or {}) do
+        local count = t.vuln.locs and #t.vuln.locs or 0
+        table.insert(file_items, {
+          label = t.file,
+          display = string.format("%s (%d)", t.file, count),
+          file = t.file,
+          vuln = t.vuln,
+        })
+      end
+      table.sort(file_items, function(a, b) return a.label < b.label end)
+      select_from_list(file_items, { prompt = type_item.label }, function(file_item)
+        local lines = build_line_items(file_item.vuln.locs or {})
+        select_from_list(lines, { prompt = file_item.label }, function(line_item)
+          open_location(group, file_item.file, line_item.line)
+        end, picker)
+      end, picker)
+    end, picker)
+  end
+
+  vim.api.nvim_create_user_command("RetrievesFindingsByType", function()
+    findings_by_type("buffer")
+  end, {})
+
+  vim.api.nvim_create_user_command("RetrievesFindingsByTypeBuffer", function()
+    findings_by_type("buffer")
+  end, {})
+
+  vim.api.nvim_create_user_command("RetrievesFindingsByTypeTelescope", function()
+    findings_by_type("telescope")
+  end, {})
+
+  vim.api.nvim_create_user_command("RetrievesScope", function()
+    local group, entry = current_group_entry()
+    if not group or not ensure_entry_or_notify(group, entry) then
+      return
+    end
+    local items = {}
+    for _, url in ipairs(entry.scope or {}) do
+      table.insert(items, { label = url, display = url, url = url })
+    end
+    select_from_list(items, { prompt = "Scope URLs" }, function(item)
+      if type(vim.ui.open) == "function" then
+        vim.ui.open(item.url)
+      else
+        local opener = vim.fn.has('mac') == 1 and 'open' or (vim.fn.executable('xdg-open') == 1 and 'xdg-open' or 'start')
+        vim.fn.jobstart({ opener, item.url }, { detach = true })
+      end
+    end)
+  end, {})
+
+  vim.api.nvim_create_user_command("RetrievesYaml", function(opts)
+    local buf = vim.api.nvim_get_current_buf()
+    local name = vim.api.nvim_buf_get_name(buf)
+    local group = detect_group(name)
+    if not group then
+      vim.notify("Retrieves: not a group file", vim.log.levels.WARN)
+      return
+    end
+    local commit = get_last_commit(group.repo_path)
+    if commit == "" then
+      vim.notify("Retrieves: unable to get git commit", vim.log.levels.ERROR)
+      return
+    end
+    local source = vim.g.retrieves_default_source or vim.g.retrieves_role or "analyst"
+    pick_yaml_file(reporting_dir, function(path)
+      reporting_dir = vim.fn.fnamemodify(path, ":h")
+      local start_line = opts.line1
+      local end_line = opts.line2
+      for line = start_line, end_line do
+        add_line_to_yaml(path, group.nickname, group.filename, commit, line, source)
+      end
+      vim.notify("Retrieves: YAML updated", vim.log.levels.INFO)
+    end)
+  end, { range = true })
+
+  vim.api.nvim_create_user_command("RetrievesReportDirect", function(opts)
+    local origin_buf = vim.api.nvim_get_current_buf()
+    local name = vim.api.nvim_buf_get_name(origin_buf)
+    local group = detect_group(name)
+    if not group then
+      vim.notify("Retrieves: not a group file", vim.log.levels.WARN)
+      return
+    end
+    local start_line = opts.line1
+    local end_line = opts.line2
+    make_request_async(GET_FINDING_ID, { group = group.name }, function(data, err)
+      if not data or not data.group then
+        vim.notify("Retrieves: error fetching findings: " .. tostring(err), vim.log.levels.ERROR)
+        return
+      end
+      local finding_items = {}
+      for _, f in ipairs(data.group.findings or {}) do
+        table.insert(finding_items, {
+          label = f.title,
+          display = string.format("%s (ID: %s | Hacker: %s | Status: %s)", f.title, f.id or "-", f.hacker or "-", f.status or "-"),
+          finding = f,
+        })
+      end
+      select_from_list(finding_items, { prompt = "Select a finding" }, function(selection)
+        local default_source = vim.g.retrieves_default_source or "analyst"
+        local max_lines = tonumber(vim.g.retrieves_max_report_lines or 100) or 100
+        local sources = { "analyst", "customer", "escape" }
+        local sorted_sources = { default_source }
+        for _, s in ipairs(sources) do
+          if s ~= default_source then
+            table.insert(sorted_sources, s)
+          end
+        end
+        vim.ui.select(sorted_sources, { prompt = "Select source" }, function(selected_source)
+          if not selected_source then return end
+          local commit = get_last_commit(group.repo_path)
+          if commit == "" then
+            vim.notify("Retrieves: unable to get git commit", vim.log.levels.ERROR)
+            return
+          end
+          local yaml_lines = { "lines:" }
+          local count = 0
+          for line = start_line, end_line do
+            count = count + 1
+            if count > max_lines then
+              vim.notify("Retrieves: selection exceeds max lines, truncating", vim.log.levels.WARN)
+              break
+            end
+            table.insert(yaml_lines, string.format("  - commit_hash: %s", commit))
+            table.insert(yaml_lines, string.format("    line: '%d'", line))
+            table.insert(yaml_lines, string.format("    path: %s", group.filename))
+            table.insert(yaml_lines, string.format("    repo_nickname: %s", group.nickname))
+            table.insert(yaml_lines, string.format("    source: %s", selected_source))
+            table.insert(yaml_lines, "    state: submitted")
+            table.insert(yaml_lines, "    tool:")
+            table.insert(yaml_lines, "      impact: direct")
+            table.insert(yaml_lines, "      name: none")
+          end
+          if count == 0 then
+            vim.notify("Retrieves: no lines selected", vim.log.levels.WARN)
+            return
+          end
+
+          vim.cmd("new")
+          local report_buf = vim.api.nvim_get_current_buf()
+          vim.bo[report_buf].filetype = "yaml"
+          vim.api.nvim_buf_set_lines(report_buf, 0, -1, false, yaml_lines)
+
+          vim.ui.select({ "Upload", "Cancel" }, {
+            prompt = string.format('Report to "%s"?', selection.label),
+          }, function(choice)
+            if choice ~= "Upload" then return end
+            local final_content = table.concat(vim.api.nvim_buf_get_lines(report_buf, 0, -1, false), "\n")
+            make_upload_request_async(
+              UPLOAD_VULNERABILITIES,
+              { findingId = selection.finding.id },
+              final_content,
+              "report_nvim.yaml",
+              function(res, upload_err)
+                if not res then
+                  vim.notify("Retrieves: upload failed - " .. tostring(upload_err), vim.log.levels.ERROR)
+                  return
+                end
+                local upload = res.uploadFile
+                if upload and upload.success then
+                  vim.notify("Retrieves: successfully uploaded", vim.log.levels.INFO)
+                  download_group_async(group.name, function(out, derr)
+                    if out then
+                      write_snapshot_for_group(group, out)
+                      if vim.api.nvim_buf_is_valid(origin_buf) then
+                        apply(origin_buf)
+                      end
+                    end
+                  end)
+                else
+                  vim.notify("Retrieves: upload failed - " .. tostring(upload and upload.message or "unknown error"), vim.log.levels.ERROR)
+                end
+              end
+            )
+          end)
+        end)
+      end)
+    end)
+  end, { range = true })
 end
 
 -- Auto-setup if sourced directly
