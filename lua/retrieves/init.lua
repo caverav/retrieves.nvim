@@ -45,6 +45,7 @@ local function detect_group(filepath)
     filename = rest,
     current_file = nickname .. "/" .. rest,
     repo_path = string.format("%s/groups/%s/%s", root, group, nickname),
+    group_path = string.format("%s/groups/%s", root, group),
   }
 end
 
@@ -53,6 +54,41 @@ local function clean_location(where)
   -- Remove trailing bracketed metadata like " (commit)" or " [..]"
   where = where:gsub("%s*[%(%[].*[%]%)]", "")
   return where
+end
+
+local function build_scope_urls(group_data)
+  local scope = {}
+  local scope_set = {}
+
+  local function add(url)
+    if not url or url == "" or scope_set[url] then return end
+    scope_set[url] = true
+    table.insert(scope, url)
+  end
+
+  if group_data and group_data.gitEnvironmentUrls then
+    for _, env in ipairs(group_data.gitEnvironmentUrls or {}) do
+      add(env.url)
+    end
+  end
+
+  if group_data and group_data.roots then
+    for _, root in ipairs(group_data.roots or {}) do
+      if root.state == "ACTIVE" and root.host then
+        local built = string.format("%s://%s", root.protocol or "https", root.host)
+        if root.port and root.port ~= 80 and root.port ~= 443 then
+          built = built .. ":" .. tostring(root.port)
+        end
+        if root.path and root.path ~= "" then
+          built = built .. "/" .. root.path
+        end
+        built = built:gsub("([^:])//+", "%1/")
+        add(built)
+      end
+    end
+  end
+
+  return scope
 end
 
 local function notify_progress(group_name, done, total)
@@ -156,8 +192,12 @@ local GET_FINDING_ID = [[
 query GetFindingsIDS($group: String!){
   group(groupName: $group) {
     organization,
-    findings { title, status, id }
-    roots { ... on GitRoot { id nickname state } }
+    findings { title, status, id, hacker }
+    gitEnvironmentUrls { url }
+    roots {
+      ... on GitRoot { id nickname state }
+      ... on URLRoot { protocol host port path state }
+    }
   }
 }
 ]]
@@ -207,13 +247,17 @@ local function download_group_async(group_name, on_done)
     end
 
     local reported, pending, roots = {}, {}, {}
+    local scope = {}
     local organization = ""
 
     if root_data.group then
       organization = root_data.group.organization or ""
+      scope = build_scope_urls(root_data.group)
       for _, r in ipairs(root_data.group.roots or {}) do
         if r.state == "ACTIVE" then
-          roots[r.nickname] = r.id
+          if r.nickname and r.id then
+            roots[r.nickname] = r.id
+          end
         end
       end
 
@@ -232,7 +276,7 @@ local function download_group_async(group_name, on_done)
 
       local function process_next_finding()
         if i > #findings then
-          local out = { reported = reported, drafts = pending, roots = roots, org = organization }
+          local out = { reported = reported, drafts = pending, roots = roots, org = organization, scope = scope }
           cache_by_group[group_name] = out
           inflight_by_group[group_name] = nil
           download_progress[group_name] = nil
@@ -358,7 +402,25 @@ end
 
 local function snapshot_path_for(group)
   return vim.g.retrieves_json_override
-    or (group.repo_path .. "/retrieves-vulns-" .. group.name .. ".json")
+    or (group.group_path .. "/retrieves-vulns-" .. group.name .. ".json")
+end
+
+local function write_snapshot_for_group(group, res)
+  if not group or not res then return end
+  local snapshot_path = snapshot_path_for(group)
+  pcall(function()
+    local fd = assert(io.open(snapshot_path, "w"))
+    fd:write(vim.json.encode({
+      reported = res.reported,
+      drafts = res.drafts,
+      org = res.org,
+      roots = res.roots,
+      scope = res.scope,
+      group = group.name,
+      exportedAt = os.date("!%Y-%m-%dT%H:%M:%SZ")
+    }))
+    fd:close()
+  end)
 end
 
 local function merge_snapshot_into_entry(entry, snapshot)
@@ -367,6 +429,7 @@ local function merge_snapshot_into_entry(entry, snapshot)
   entry.reported = snapshot.reported or entry.reported or {}
   entry.drafts = snapshot.drafts or entry.drafts or {}
   entry.roots = snapshot.roots or entry.roots or {}
+  entry.scope = snapshot.scope or entry.scope or {}
   entry.org = snapshot.org or entry.org or ""
   return entry
 end
@@ -441,18 +504,7 @@ local function apply(buf)
     if token and token ~= "" then
       download_group_async(group.name, function(res, derr)
         if res then
-          pcall(function()
-            local fd = assert(io.open(snapshot_path, "w"))
-            fd:write(vim.json.encode({
-              reported = res.reported,
-              drafts = res.drafts,
-              org = res.org,
-              roots = res.roots,
-              group = group.name,
-              exportedAt = os.date("!%Y-%m-%dT%H:%M:%SZ")
-            }))
-            fd:close()
-          end)
+          write_snapshot_for_group(group, res)
           if vim.api.nvim_buf_is_valid(buf) then apply(buf) end
         end
       end)
@@ -604,15 +656,7 @@ function M.setup()
     download_group_async(group.name, function(res, err)
       if not res then return end
       -- Write snapshot
-      local snapshot_path = snapshot_path_for(group)
-      pcall(function()
-        local fd = assert(io.open(snapshot_path, "w"))
-        fd:write(vim.json.encode({
-          reported = res.reported, drafts = res.drafts, org = res.org, roots = res.roots,
-          group = group.name, exportedAt = os.date("!%Y-%m-%dT%H:%M:%SZ")
-        }))
-        fd:close()
-      end)
+      write_snapshot_for_group(group, res)
       -- Apply to current buffer
       if vim.api.nvim_buf_is_valid(buf) then M.refresh() end
     end)
