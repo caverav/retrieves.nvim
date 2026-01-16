@@ -923,7 +923,9 @@ local function open_tree_view(nodes, title, group, main_win)
     end
 
     local lines = { " " .. title, string.rep("─", #title + 2) }
+    local pending_icons = {}
     line_to_node = {}
+    vim.api.nvim_buf_clear_namespace(buf, ns, 0, -1)
 
     local function add_node(node)
       local indent = string.rep("  ", node.depth or 0)
@@ -931,8 +933,19 @@ local function open_tree_view(nodes, title, group, main_win)
       if node.children and #node.children > 0 then
         prefix = node.expanded and "▾ " or "▸ "
       end
-      table.insert(lines, indent .. prefix .. (node.label or ""))
-      line_to_node[#lines] = node
+      local icon_text = node.icon and (node.icon .. " ") or ""
+      table.insert(lines, indent .. prefix .. icon_text .. (node.label or ""))
+      local line_idx = #lines
+      line_to_node[line_idx] = node
+      if node.icon and node.icon_hl then
+        local icon_start = #indent + #prefix
+        table.insert(pending_icons, {
+          line = line_idx - 1,
+          col = icon_start,
+          len = #node.icon,
+          hl = node.icon_hl,
+        })
+      end
       if node.expanded and node.children then
         for _, child in ipairs(node.children) do
           add_node(child)
@@ -947,6 +960,14 @@ local function open_tree_view(nodes, title, group, main_win)
     vim.api.nvim_buf_set_option(buf, "modifiable", true)
     vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
     vim.api.nvim_buf_set_option(buf, "modifiable", false)
+    for _, icon in ipairs(pending_icons) do
+      if icon.line >= 0 and icon.line < #lines then
+        vim.api.nvim_buf_set_extmark(buf, ns, icon.line, icon.col, {
+          end_col = icon.col + icon.len,
+          hl_group = icon.hl,
+        })
+      end
+    end
 
     local target_line = math.min(prev_line, #lines)
     if prev_node then
@@ -1359,6 +1380,18 @@ function M.setup()
     return items
   end
 
+local function file_label(path)
+  local basename = vim.fn.fnamemodify(path, ":t")
+  local ok, devicons = pcall(require, "nvim-web-devicons")
+  if ok then
+    local icon, hl = devicons.get_icon(basename, nil, { default = true })
+    if icon and icon ~= "" then
+      return { text = path, icon = icon, hl = hl }
+    end
+  end
+  return { text = path }
+end
+
 local function build_tree_by_file(group, reported)
   local file_cache = {}
   local function line_text(file, line)
@@ -1393,7 +1426,16 @@ local function build_tree_by_file(group, reported)
     return a.file < b.file
   end)
   for _, f in ipairs(files) do
-    local file_node = { kind = "file", depth = 0, label = f.file, expanded = false, children = {} }
+    local label = file_label(f.file)
+    local file_node = {
+      kind = "file",
+      depth = 0,
+      label = label.text,
+      icon = label.icon,
+      icon_hl = label.hl,
+      expanded = false,
+      children = {},
+    }
     local titles = {}
     for title, data in pairs(f.vulns or {}) do
       table.insert(titles, { title = title, data = data })
@@ -1471,10 +1513,13 @@ local function build_tree_by_type(group, reported)
     table.sort(t.entries, function(a, b) return a.file < b.file end)
     for _, entry in ipairs(t.entries) do
       local count = entry.data.locs and #entry.data.locs or 0
+      local label = file_label(entry.file)
       local file_node = {
         kind = "file",
         depth = 1,
-        label = string.format("%s (%d)", entry.file, count),
+        label = string.format("%s (%d)", label.text, count),
+        icon = label.icon,
+        icon_hl = label.hl,
         expanded = false,
         children = {},
       }
